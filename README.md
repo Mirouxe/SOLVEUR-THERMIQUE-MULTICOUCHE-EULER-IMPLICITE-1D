@@ -56,11 +56,14 @@ $$\rho(T) \cdot c_p(T) \cdot \frac{\partial T}{\partial t} = \frac{\partial}{\pa
 | **Neumann** | Flux imposé | `-k·∂T/∂x = q` |
 | **Robin** | Convection | `-k·∂T/∂x = h·(T - T_∞)` |
 | **Adiabatique** | Flux nul | `∂T/∂x = 0` |
+| **Rayonnement** | Stefan-Boltzmann | `-k·∂T/∂x = σ·ε·(T⁴ - T_s⁴)` |
+| **Convection + Rayonnement** | Combiné | `-k·∂T/∂x = h·(T - T_∞) + σ·ε·(T⁴ - T_s⁴)` |
 
 ### Fonctionnalités avancées
 - ✅ Propriétés thermiques dépendantes de la température k(T), ρ(T), cp(T)
 - ✅ Nombre arbitraire de couches
 - ✅ Conditions limites variables dans le temps
+- ✅ **Rayonnement thermique** avec l'environnement (loi de Stefan-Boltzmann)
 - ✅ Bibliothèque de 44 matériaux avec données réelles
 - ✅ Suite de tests de validation complète
 
@@ -204,6 +207,37 @@ bc = lambda t: {'type': 'convection', 'h': 500, 'T_inf': 400}
 bc = lambda t: {'type': 'adiabatic'}
 ```
 
+#### Rayonnement (Stefan-Boltzmann)
+
+Le flux radiatif est calculé selon la loi de Stefan-Boltzmann :
+
+$$q_{rad} = \sigma \cdot \varepsilon \cdot (T_{surface}^4 - T_{environnement}^4)$$
+
+où σ = 5.67×10⁻⁸ W/(m²·K⁴) est la constante de Stefan-Boltzmann.
+
+```python
+# Rayonnement pur
+bc = lambda t: {
+    'type': 'radiation',
+    'epsilon': 0.8,    # Émissivité de la surface (0 à 1)
+    'T_s': 300         # Température de l'environnement [K]
+}
+```
+
+#### Convection + Rayonnement combinés
+
+Pour les applications haute température, il est courant de combiner convection et rayonnement :
+
+```python
+bc = lambda t: {
+    'type': 'convection_radiation',
+    'h': 50,           # Coefficient convectif [W/(m²·K)]
+    'T_inf': 400,      # Température du fluide [K]
+    'epsilon': 0.3,    # Émissivité
+    'T_s': 350         # Température radiative de l'environnement [K]
+}
+```
+
 #### Conditions variables dans le temps
 
 ```python
@@ -212,14 +246,22 @@ def bc_rampe(t):
     T_imposed = 300 + 10 * t  # Augmente de 10 K/s
     return {'type': 'dirichlet', 'T': min(T_imposed, 600)}
 
-# Lecture depuis un fichier CSV
+# Lecture depuis un fichier CSV (avec rayonnement)
 data = np.loadtxt('flux.csv', delimiter=',', skiprows=1)
-t_data, h_data, T_inf_data = data[:, 0], data[:, 1], data[:, 2]
+t_data = data[:, 0]
+h_data = data[:, 1]
+T_inf_data = data[:, 2]
+T_s_data = data[:, 3]  # Température environnement pour rayonnement
 
 def bc_from_csv(t):
     h = np.interp(t, t_data, h_data)
     T_inf = np.interp(t, t_data, T_inf_data)
-    return {'type': 'convection', 'h': h, 'T_inf': T_inf}
+    T_s = np.interp(t, t_data, T_s_data)
+    return {
+        'type': 'convection_radiation',
+        'h': h, 'T_inf': T_inf,
+        'epsilon': 0.3, 'T_s': T_s
+    }
 ```
 
 ### 4. Lancer une simulation complète
@@ -425,6 +467,40 @@ $$\rho_i c_{p,i} \frac{T_i^{n+1} - T_i^n}{\Delta t} = \frac{k_{i+1/2}(T_{i+1}^{n
 - Fo >> 1 : Régime permanent atteint
 - Bi << 0.1 : Température quasi-uniforme (lumped capacitance)
 - Bi >> 1 : Résistance de convection négligeable
+
+### Rayonnement thermique
+
+Le flux radiatif échangé entre une surface et son environnement est donné par la loi de Stefan-Boltzmann :
+
+$$q_{rad} = \sigma \cdot \varepsilon \cdot (T_{surface}^4 - T_{environnement}^4)$$
+
+où :
+- σ = 5.670374419×10⁻⁸ W/(m²·K⁴) est la constante de Stefan-Boltzmann
+- ε est l'émissivité de la surface (0 ≤ ε ≤ 1)
+- Les températures sont en Kelvin
+
+#### Linéarisation pour le schéma implicite
+
+Le terme radiatif étant non-linéaire (T⁴), on le linéarise autour de la température actuelle :
+
+$$q_{rad} \approx h_{rad} \cdot (T_{eq} - T^{n+1})$$
+
+avec le coefficient de transfert radiatif :
+
+$$h_{rad} = 4 \cdot \sigma \cdot \varepsilon \cdot T^3$$
+
+Cette linéarisation permet de conserver un système linéaire tout en capturant l'essentiel de la physique du rayonnement.
+
+#### Valeurs typiques d'émissivité
+
+| Surface | ε |
+|---------|---|
+| Corps noir idéal | 1.0 |
+| Acier oxydé | 0.7 - 0.9 |
+| Acier poli | 0.1 - 0.3 |
+| Aluminium poli | 0.04 - 0.1 |
+| Peinture noire | 0.9 - 0.98 |
+| Béton | 0.85 - 0.95 |
 
 ---
 

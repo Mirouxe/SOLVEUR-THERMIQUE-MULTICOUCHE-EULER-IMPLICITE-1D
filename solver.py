@@ -13,9 +13,20 @@ Schéma numérique:
     - Spatial: Différences finies centrées
 
 Conditions limites supportées:
-    - Gauche: Convection (Robin) ou flux imposé (Neumann) ou isotherme (Dirichlet)
-    - Droite: Adiabatique (Neumann homogène) ou isotherme (Dirichlet)
+    - Gauche/Droite: 
+        * Convection (Robin): -k·∂T/∂x = h·(T - T_inf)
+        * Flux imposé (Neumann): -k·∂T/∂x = q
+        * Isotherme (Dirichlet): T = T_imposé
+        * Adiabatique: ∂T/∂x = 0
+        * Rayonnement: -k·∂T/∂x = σ·ε·(T⁴ - T_s⁴)
+        * Convection + Rayonnement combinés
+        
+Constantes physiques:
+    σ (Stefan-Boltzmann) = 5.670374419e-8 W/(m²·K⁴)
 """
+
+# Constante de Stefan-Boltzmann [W/(m²·K⁴)]
+STEFAN_BOLTZMANN = 5.670374419e-8
 
 import numpy as np
 
@@ -105,6 +116,11 @@ class ThermalSolver1D:
         """
         Construit le système linéaire A*T_new = b pour le schéma implicite.
         
+        Pour le rayonnement (non-linéaire), on linéarise autour de T actuel:
+            q_rad = σ·ε·(T⁴ - T_s⁴) ≈ σ·ε·(T_old⁴ - T_s⁴) + 4·σ·ε·T_old³·(T_new - T_old)
+        Ce qui donne un coefficient de transfert radiatif équivalent:
+            h_rad = 4·σ·ε·T_old³
+        
         Args:
             T: Champ de température actuel [K]
             dt: Pas de temps [s]
@@ -112,9 +128,16 @@ class ThermalSolver1D:
                      {'type': 'convection', 'h': float, 'T_inf': float}
                      {'type': 'flux', 'q': float}  (q positif = entrant)
                      {'type': 'dirichlet', 'T': float}
+                     {'type': 'radiation', 'epsilon': float, 'T_s': float}
+                     {'type': 'convection_radiation', 'h': float, 'T_inf': float, 
+                      'epsilon': float, 'T_s': float}
             bc_right: Dict définissant la CL droite
                       {'type': 'adiabatic'}
                       {'type': 'dirichlet', 'T': float}
+                      {'type': 'convection', 'h': float, 'T_inf': float}
+                      {'type': 'radiation', 'epsilon': float, 'T_s': float}
+                      {'type': 'convection_radiation', 'h': float, 'T_inf': float,
+                       'epsilon': float, 'T_s': float}
                       
         Returns:
             Tuple (A, b) du système linéaire
@@ -154,6 +177,50 @@ class ThermalSolver1D:
             A[0, 0] = 1 + coef * (k0p / dx)
             A[0, 1] = -coef * (k0p / dx)
             b[0] = T[0] + coef * q
+        elif bc_left['type'] == 'radiation':
+            # Rayonnement pur: q_rad = σ·ε·(T⁴ - T_s⁴)
+            # Linéarisation: h_rad = 4·σ·ε·T_old³, q_rad ≈ h_rad·(T - T_rad_eq)
+            # où T_rad_eq = T_old - (T_old⁴ - T_s⁴)/(4·T_old³)
+            epsilon = bc_left['epsilon']
+            T_s = bc_left['T_s']
+            T0 = T[0]
+            h_rad = 4 * STEFAN_BOLTZMANN * epsilon * T0**3
+            # Flux radiatif linéarisé: q = h_rad*(T_rad_eq - T_new) où T_rad_eq est calculé
+            # pour que q(T_old) = σ·ε·(T_s⁴ - T_old⁴) (flux entrant si T_s > T)
+            q_rad_old = STEFAN_BOLTZMANN * epsilon * (T_s**4 - T0**4)
+            T_rad_eq = T0 + q_rad_old / (h_rad + 1e-10)  # Température équivalente
+            
+            k0p = 0.5 * (k_nodes[0] + k_nodes[1])
+            rho0 = rho_nodes[0]
+            cp0 = cp_nodes[0]
+            coef = dt / (rho0 * cp0 * dx / 2)
+            A[0, 0] = 1 + coef * (k0p / dx + h_rad)
+            A[0, 1] = -coef * (k0p / dx)
+            b[0] = T[0] + coef * h_rad * T_rad_eq
+        elif bc_left['type'] == 'convection_radiation':
+            # Convection + Rayonnement combinés
+            h_conv = bc_left['h']
+            T_inf = bc_left['T_inf']
+            epsilon = bc_left['epsilon']
+            T_s = bc_left['T_s']
+            T0 = T[0]
+            
+            # Coefficient radiatif linéarisé
+            h_rad = 4 * STEFAN_BOLTZMANN * epsilon * T0**3
+            q_rad_old = STEFAN_BOLTZMANN * epsilon * (T_s**4 - T0**4)
+            T_rad_eq = T0 + q_rad_old / (h_rad + 1e-10)
+            
+            # Coefficient total et température équivalente pondérée
+            h_total = h_conv + h_rad
+            T_eq = (h_conv * T_inf + h_rad * T_rad_eq) / (h_total + 1e-10)
+            
+            k0p = 0.5 * (k_nodes[0] + k_nodes[1])
+            rho0 = rho_nodes[0]
+            cp0 = cp_nodes[0]
+            coef = dt / (rho0 * cp0 * dx / 2)
+            A[0, 0] = 1 + coef * (k0p / dx + h_total)
+            A[0, 1] = -coef * (k0p / dx)
+            b[0] = T[0] + coef * h_total * T_eq
         else:
             raise ValueError(f"Type de CL gauche inconnu: {bc_left['type']}")
         
@@ -194,6 +261,54 @@ class ThermalSolver1D:
             A[i, i-1] = -coef * (kim / dx)
             A[i, i] = 1 + coef * (kim / dx + h)
             b[i] = T[i] + coef * h * T_inf
+        elif bc_right['type'] == 'radiation':
+            # Rayonnement pur
+            epsilon = bc_right['epsilon']
+            T_s = bc_right['T_s']
+            Ti = T[i]
+            h_rad = 4 * STEFAN_BOLTZMANN * epsilon * Ti**3
+            q_rad_old = STEFAN_BOLTZMANN * epsilon * (T_s**4 - Ti**4)
+            T_rad_eq = Ti + q_rad_old / (h_rad + 1e-10)
+            
+            kim = 0.5 * (k_nodes[i] + k_nodes[i-1])
+            rhoi = rho_nodes[i]
+            cpi = cp_nodes[i]
+            coef = dt / (rhoi * cpi * dx / 2)
+            A[i, i-1] = -coef * (kim / dx)
+            A[i, i] = 1 + coef * (kim / dx + h_rad)
+            b[i] = T[i] + coef * h_rad * T_rad_eq
+        elif bc_right['type'] == 'convection_radiation':
+            # Convection + Rayonnement combinés
+            h_conv = bc_right['h']
+            T_inf = bc_right['T_inf']
+            epsilon = bc_right['epsilon']
+            T_s = bc_right['T_s']
+            Ti = T[i]
+            
+            h_rad = 4 * STEFAN_BOLTZMANN * epsilon * Ti**3
+            q_rad_old = STEFAN_BOLTZMANN * epsilon * (T_s**4 - Ti**4)
+            T_rad_eq = Ti + q_rad_old / (h_rad + 1e-10)
+            
+            h_total = h_conv + h_rad
+            T_eq = (h_conv * T_inf + h_rad * T_rad_eq) / (h_total + 1e-10)
+            
+            kim = 0.5 * (k_nodes[i] + k_nodes[i-1])
+            rhoi = rho_nodes[i]
+            cpi = cp_nodes[i]
+            coef = dt / (rhoi * cpi * dx / 2)
+            A[i, i-1] = -coef * (kim / dx)
+            A[i, i] = 1 + coef * (kim / dx + h_total)
+            b[i] = T[i] + coef * h_total * T_eq
+        elif bc_right['type'] == 'flux':
+            # Flux imposé à droite (q positif = sortant)
+            q = bc_right['q']
+            kim = 0.5 * (k_nodes[i] + k_nodes[i-1])
+            rhoi = rho_nodes[i]
+            cpi = cp_nodes[i]
+            coef = dt / (rhoi * cpi * dx / 2)
+            A[i, i-1] = -coef * (kim / dx)
+            A[i, i] = 1 + coef * (kim / dx)
+            b[i] = T[i] - coef * q  # flux sortant = -q entrant
         else:
             raise ValueError(f"Type de CL droite inconnu: {bc_right['type']}")
         
@@ -365,6 +480,42 @@ def compute_heat_flux(T, x, k):
     else:
         k_interf = 0.5 * (k[:-1] + k[1:])
     return -k_interf * dTdx
+
+
+def compute_radiation_flux(T_surface, T_surroundings, epsilon):
+    """
+    Calcule le flux radiatif selon la loi de Stefan-Boltzmann.
+    
+    q = σ·ε·(T_surface⁴ - T_surroundings⁴)
+    
+    Args:
+        T_surface: Température de la surface [K]
+        T_surroundings: Température de l'environnement [K]
+        epsilon: Émissivité de la surface (0 à 1)
+        
+    Returns:
+        Flux radiatif [W/m²] (positif si la surface perd de l'énergie)
+    """
+    return STEFAN_BOLTZMANN * epsilon * (T_surface**4 - T_surroundings**4)
+
+
+def compute_radiation_coefficient(T_surface, epsilon):
+    """
+    Calcule le coefficient de transfert radiatif linéarisé.
+    
+    h_rad = 4·σ·ε·T³
+    
+    Ce coefficient permet d'approximer le flux radiatif comme:
+    q_rad ≈ h_rad·(T_surface - T_surroundings) pour |T_surface - T_surroundings| << T
+    
+    Args:
+        T_surface: Température de la surface [K]
+        epsilon: Émissivité de la surface (0 à 1)
+        
+    Returns:
+        Coefficient de transfert radiatif [W/(m²·K)]
+    """
+    return 4 * STEFAN_BOLTZMANN * epsilon * T_surface**3
 
 
 def compute_energy_balance(T, T_prev, rho, cp, dx, dt, q_left, q_right):
